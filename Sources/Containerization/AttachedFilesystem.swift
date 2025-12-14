@@ -53,3 +53,35 @@ public struct AttachedFilesystem: Sendable {
         self.options = options
     }
 }
+
+
+/// sara
+import Foundation
+import ContainerizationEXT4
+
+extension AttachedFilesystem {
+
+    static func writableOverlay(
+        at url: URL,
+        sizeBytes: UInt64
+    ) async throws -> AttachedFilesystem {
+
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: sizeBytes)
+        try handle.close()
+
+        try await EXT4.makeFilesystem(
+            image: url,
+            label: "container-upper"
+        )
+
+        return AttachedFilesystem(
+            type: "ext4",
+            source: url.path,
+            destination: "",
+            options: []
+        )
+    }
+}

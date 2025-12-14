@@ -44,6 +44,8 @@ public final class LinuxContainer: Container, Sendable {
         public var cpus: Int = 4
         /// The memory in bytes to give to the container.
         public var memoryInBytes: UInt64 = 1024.mib()
+        /// sara below: requested “disk capacity” / writable layer size
+        public var rootfsWritableBytes: UInt64? 
         /// The hostname for the container.
         public var hostname: String = ""
         /// The system control options for the container.
@@ -72,6 +74,8 @@ public final class LinuxContainer: Container, Sendable {
             process: LinuxProcessConfiguration,
             cpus: Int = 4,
             memoryInBytes: UInt64 = 1024.mib(),
+            /// sara
+            rootfsWritableBytes: UInt64? = nil,
             hostname: String = "",
             sysctl: [String: String] = [:],
             interfaces: [any Interface] = [],
@@ -86,6 +90,8 @@ public final class LinuxContainer: Container, Sendable {
             self.process = process
             self.cpus = cpus
             self.memoryInBytes = memoryInBytes
+            /// sara
+            self.rootfsWritableBytes = rootfsWritableBytes
             self.hostname = hostname
             self.sysctl = sysctl
             self.interfaces = interfaces
@@ -391,17 +397,47 @@ extension LinuxContainer {
     /// and set up the runtime environment. The container's init process
     /// is NOT running afterwards.
     public func create() async throws {
+
+        let rootPath = Self.guestRootfsPath(self.id)
+
         try await self.state.withLock { state in
             try state.validateForCreate()
+
+            /// sara below
+            // Build filesystem mounts for this container
+            var containerMounts: [Mount] = [self.rootfs]
+            containerMounts.append(contentsOf: self.config.mounts)
+
+            if let bytes = self.config.rootfsWritableBytes {
+                let runtimeDir = try self.vmm.runtimeDirectory(for: self.id)
+                let upperURL = runtimeDir.appendingPathComponent("upper.ext4")
+
+                guard bytes > 0 else {
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "rootfs writable size must be greater than zero"
+                    )
+                }
+                let upperFS = try await AttachedFilesystem.writableOverlay(
+                    at: upperURL,
+                    sizeBytes: bytes
+                )
+
+                containerMounts.append(upperFS)
+            }
+
 
             let vmConfig = VMConfiguration(
                 cpus: self.cpus,
                 memoryInBytes: self.memoryInBytes,
                 interfaces: self.interfaces,
-                mountsByID: [self.id: [self.rootfs] + self.config.mounts],
+                mountsByID: [self.id: containerMounts],
                 bootLog: self.config.bootLog,
                 nestedVirtualization: self.config.virtualization
             )
+
+            /// sara done
+
             let creationConfig = StandardVMConfig(configuration: vmConfig)
             let vm = try await self.vmm.create(config: creationConfig)
             let relayManager = UnixSocketRelayManager(vm: vm, log: self.logger)
@@ -412,12 +448,48 @@ extension LinuxContainer {
                     try await agent.standardSetup()
 
                     // Mount the rootfs.
-                    guard let attachments = vm.mounts[self.id], let rootfsAttachment = attachments.first else {
+                    // sara below
+                    guard let attachments = vm.mounts[self.id], let baseAttachment = attachments.first else {
                         throw ContainerizationError(.notFound, message: "rootfs mount not found")
                     }
-                    var rootfs = rootfsAttachment.to
-                    rootfs.destination = Self.guestRootfsPath(self.id)
-                    try await agent.mount(rootfs)
+
+                    if attachments.count >= 2 {
+                        let upperAttachment = attachments[1]
+
+                        let baseLower = "/run/container/\(self.id)/lower"
+                        let upperFS   = "/run/container/\(self.id)/upperfs"
+                        let upperDir  = "\(upperFS)/upper"
+                        let workDir   = "\(upperFS)/work"
+
+                        try await agent.mkdir(path: baseLower, all: true, perms: 0o755)
+                        try await agent.mkdir(path: upperFS,  all: true, perms: 0o755)
+                        try await agent.mkdir(path: upperDir, all: true, perms: 0o755)
+                        try await agent.mkdir(path: workDir,  all: true, perms: 0o755)
+                        try await agent.mkdir(path: rootPath, all: true, perms: 0o755)
+
+                        var lower = baseAttachment.to
+                        lower.destination = baseLower
+                        if !lower.options.contains("ro") { lower.options.append("ro") }
+                        try await agent.mount(lower)
+
+                        var upper = upperAttachment.to
+                        upper.destination = upperFS
+                        try await agent.mount(upper)
+
+                        let overlayOpt = "lowerdir=\(baseLower),upperdir=\(upperDir),workdir=\(workDir)"
+                        let overlay = ContainerizationOCI.Mount(
+                            type: "overlay",
+                            source: "overlay",
+                            destination: rootPath,
+                            options: [overlayOpt]
+                        )
+                        try await agent.mount(overlay)
+                    } else {
+                        var rootfs = baseAttachment.to
+                        rootfs.destination = Self.guestRootfsPath(self.id)
+                        try await agent.mount(rootfs)
+                    }
+                    /// sara done
 
                     // Start up our friendly unix socket relays.
                     for socket in self.config.sockets {
@@ -443,10 +515,10 @@ extension LinuxContainer {
 
                     // Setup /etc/resolv.conf and /etc/hosts if asked for.
                     if let dns = self.config.dns {
-                        try await agent.configureDNS(config: dns, location: rootfs.destination)
+                        try await agent.configureDNS(config: dns, location: rootPath)
                     }
                     if let hosts = self.config.hosts {
-                        try await agent.configureHosts(config: hosts, location: rootfs.destination)
+                        try await agent.configureHosts(config: hosts, location: rootPath)
                     }
 
                 }
@@ -588,12 +660,15 @@ extension LinuxContainer {
                         timeoutInSeconds: 5
                     )
 
-                    // Today, we leave EBUSY looping and other fun logic up to the
-                    // guest agent.
-                    try await agent.umount(
-                        path: Self.guestRootfsPath(self.id),
-                        flags: 0
-                    )
+                    let rootfsPath = Self.guestRootfsPath(self.id)
+                    let baseLower  = "/run/container/\(self.id)/lower"
+                    let upperFS    = "/run/container/\(self.id)/upperfs"
+
+                    try? await agent.umount(path: rootfsPath, flags: 0)
+
+                    try? await agent.umount(path: upperFS, flags: 0)
+
+                    try? await agent.umount(path: baseLower, flags: 0)
 
                     try await agent.sync()
                 }

@@ -66,4 +66,47 @@ struct LinuxContainerTests {
 
         #expect(process.arguments == ["/bin/sh", "-c", "echo 'hello'", "&&", "sleep 10"])
     }
+
+    @Test func overlayWritableRootfsLifecycle() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: tempDir,
+            withIntermediateDirectories: true
+        )
+
+        let vmm = TestVirtualMachineManager(runtimeDir: tempDir)
+
+        let rootfs = Mount.any(
+            type: "virtiofs",
+            source: "/fake/rootfs",
+            destination: "/"
+        )
+
+        let container = try LinuxContainer(
+            "overlay-lifecycle",
+            rootfs: rootfs,
+            vmm: vmm
+        ) { config in
+            config.rootfsWritableBytes = 128.mib()
+        }
+
+        try await container.create()
+
+        let upperDisk = tempDir
+            .appendingPathComponent("overlay-lifecycle")
+            .appendingPathComponent("upper.ext4")
+
+        #expect(FileManager.default.fileExists(atPath: upperDisk.path))
+        let attrs = try FileManager.default.attributesOfItem(atPath: upperDisk.path)
+        #expect(attrs[.size] as? UInt64 == 128.mib())
+
+        let overlayMounts = vmm.recordedMounts.filter { $0.type == "overlay" }
+        #expect(overlayMounts.count == 1)
+
+        try await container.stop()
+
+        #expect(!FileManager.default.fileExists(atPath: upperDisk.path))
+    }
+
 }
